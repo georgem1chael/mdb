@@ -37,6 +37,19 @@ typedef struct {
 
 Symbol sym_table[MAX_SYMBOLS]; //inmemory symbol table
 
+#define MAX_BREAKPOINTS 64
+
+typedef struct{
+	uint64_t addr;
+	long original_byte; //original code before the injected int3
+	int enabled; // 1 = active else 0 if symbol is not resolved yet
+	char symbol[128];
+} Breakpoint;
+
+Breakpoint bp_table[MAX_BREAKPOINTS];
+int bp_count = 0;
+
+
 int sym_count = 0; //how many symbols loaded
 
 //Removed hardcode breakpoint
@@ -133,6 +146,130 @@ uint64_t find_symbol(const char *name){
     return 0;
 }
 
+void breakpoint_command(const char *arg){
+	uint64_t addr = 0;
+	char symbol[128] = {0};
+
+	if(arg[0] == '*'){
+		// Breakpoint using hex address
+		addr = (uint64_t)strtoull(arg+1, NULL, 16);
+		snprintf(symbol, sizeof(symbol), "%s", arg);
+		if(addr == 0){
+			fprintf(stderr, "Invalid address: %s\n", arg);
+			return;
+		}
+	}
+	else{
+		// Breakpoint using symbol name
+		addr = find_symbol(arg);
+		snprintf(symbol, sizeof(symbol), "%s", arg);
+		if(addr == 0){
+			// Symbol not foound, ask to set it as pending
+			fprintf(stderr, "Symbol '%s' not found, Enable as pending breakpoint? (y/n) ", arg);
+			fflush(stderr);
+			char ans[8];
+			if(!fgets(ans, sizeof(ans), stdin)) 
+				return;
+			if(ans[0] == 'y' || ans[0] == 'Y'){
+				if(bp_count >= MAX_BREAKPOINTS){
+					fprintf(stderr, "Breakpoint table full.\n");
+					return;
+				}
+				bp_table[bp_count].addr = 0;
+				bp_table[bp_count].enabled = 0;
+				bp_table[bp_count].original_byte = 0;
+				strncpy(bp_table[bp_count].symbol, symbol, 127);
+				bp_count++;
+				fprintf(stderr, "Pending breakpoint %d set for '%s'.\n", bp_count, arg);
+			}
+			return;
+		}
+	}
+
+	if(bp_count >= MAX_BREAKPOINTS){
+		fprintf(stderr, "Breakpoint table full.\n");
+		return;
+	}
+	
+	bp_table[bp_count].addr = addr;
+	bp_table[bp_count].enabled = 1;
+	bp_table[bp_count].original_byte = 0; // will be filled later
+	strncpy(bp_table[bp_count].symbol, symbol, 127);
+	bp_count++;
+	
+	if(arg[0] == '*')
+		fprintf(stderr, "Breakpoint %d set at %s.\n", bp_count, symbol);
+	else
+		fprintf(stderr, "Breakpoint %d set at %s (0x%lx). \n", bp_count, symbol, addr);	
+}
+
+void list_command(void){
+	if(bp_count == 0){
+		fprintf(stderr, "No breakpoints set. \n");
+		return;
+	}
+	for(int i =0; i < bp_count; i++){
+		if(bp_table[i].enabled)
+			fprintf(stderr, " %d: %s at 0x%lx [enabled]\n", i+1, bp_table[i].symbol, bp_table[i].addr);
+		else
+			fprintf(stderr, " %d: %s [pending]\n", i+1, bp_table[i].symbol);
+	}
+}
+
+void delete_command(const char *arg){
+	int n = atoi(arg);
+	if(n < 1 || n > bp_count){
+		fprintf(stderr, "No breakpoint number %d.\n", n);
+		return;
+	}
+	fprintf(stderr, "Delete breakpoint %d (%s).\n", n, bp_table[n-1].symbol);
+	for(int i=n-1; i < bp_count - 1; i++)
+		bp_table[i] = bp_table[i+1];
+	bp_count--;
+}
+
+//Main command loop for all inputs
+void command_loop(void){
+	char line[256];
+
+	while(1){
+		fprintf(stderr, "(mdb) ");
+		fflush(stderr);
+		if(!fgets(line, sizeof(line), stdin))
+			break;
+		line[strcspn(line, "\n")] = '\0';
+		if(strncmp(line, "b ", 2) == 0){
+			//Breakpoint command
+			breakpoint_command(line+2);
+		}
+		else if(strcmp(line, "l") == 0){
+			//List Breakpoints
+			list_command();
+		}
+		else if(strncmp(line, "d ", 2) == 0){
+			//Delete breakpoint
+			delete_command(line+2);
+		}
+		else if (strcmp(line, "r") == 0) {
+           		// run
+           		fprintf(stderr, "[stub] r command - not yet implemented\n");
+		} 
+		else if (strcmp(line, "c") == 0) {
+            		// continue
+            		fprintf(stderr, "[stub] c command - not yet implemented\n");
+        	}
+	     	else if (strcmp(line, "q") == 0) {
+            		fprintf(stderr, "Bye\n");
+            		exit(0);
+
+        	}
+		else if (line[0] != '\0') {
+            		fprintf(stderr, "Unknown command: %s\n", line);
+            		fprintf(stderr, "Commands: b <sym|*addr>, l, d <n>, r, c, q\n");
+        	}
+	}
+}
+
 int main(int argc, char **argv)
 {
     if (argc <= 1)
@@ -140,29 +277,7 @@ int main(int argc, char **argv)
 
     load_symbols(argv[1]);
 
-    /* fork() for executing the program that is analyzed.  */
-    pid_t pid = fork();
-    switch (pid) {
-        case -1: /* error */
-            die("%s", strerror(errno));
-        case 0:  /* Code that is run by the child. */
-            /* Start tracing.  */
-            ptrace(PTRACE_TRACEME, 0, 0, 0);
-            /* execvp() is a system call, the child will block and
-               the parent must do waitpid().
-               The waitpid() of the parent is in the label
-               waitpid_for_execvp.
-             */
-            execvp(argv[1], argv + 1);
-            die("%s", strerror(errno));
-    }
+    command_loop();
 
-    /* Code that is run by the parent.  */
-    ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_EXITKILL);
-    waitpid(pid, 0, 0);
-
-    /* [PHASE 0] Temporarily resume child so it exits cleanly */
-    ptrace(PTRACE_CONT, pid, 0, 0);
-    waitpid(pid, 0, 0); /* wait for child to exit */
     return 0;
 }
