@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 
 /* POSIX */
 #include <unistd.h>
@@ -18,6 +19,9 @@
 #include <fcntl.h>
 #include <gelf.h>
 #include <libelf.h>
+
+/* Dissambly */
+#include <capstone/capstone.h>
 
 #define MAX_SYMBOLS 1024
 
@@ -48,11 +52,70 @@ typedef struct{
 
 Breakpoint bp_table[MAX_BREAKPOINTS];
 int bp_count = 0;
-
-
 int sym_count = 0; //how many symbols loaded
 
-//Removed hardcode breakpoint
+csh cs_handle;
+
+void read_child_memory(pid_t pid, uint64_t addr, uint8_t *buf, size_t size) {
+    // PTRACE_PEEKDATA reads 8 bytes at a time
+    size_t i = 0;
+    while (i < size) {
+        long word = ptrace(PTRACE_PEEKDATA, pid, (void *)(addr + i), 0);
+        if (word == -1 && errno != 0) break;
+
+        //copy up to 8 bytes into buffer
+        size_t to_copy = size - i < 8 ? size - i : 8;
+        memcpy(buf + i, &word, to_copy);
+        i += 8;
+    }
+}
+
+void disas_at(pid_t pid, uint64_t addr) {
+    // read 128 bytes from child mem,  enough for 11 instructions
+    uint8_t buf[128];
+    memset(buf, 0, sizeof(buf));
+    read_child_memory(pid, addr, buf, sizeof(buf));
+
+    cs_insn *insn;
+    size_t count = cs_disasm(cs_handle, buf, sizeof(buf), addr, 0, &insn);
+
+    if (count == 0) {
+        fprintf(stderr, "[mdb] disassembly failed at 0x%lx.\n", addr);
+        return;
+    }
+
+    size_t limit = count < 11 ? count : 11;
+    for (size_t i = 0; i < limit; i++) {
+
+        // check if this address matches a symbol
+        const char *sym = NULL;
+        for (int s = 0; s < sym_count; s++) {
+            if (sym_table[s].addr == insn[i].address) {
+                sym = sym_table[s].name;
+                break;
+            }
+        }
+        if (i == 0)
+            fprintf(stderr, "=> ");
+        else
+            fprintf(stderr, "   ");
+
+        if (sym)
+        	fprintf(stderr, "0x%lx <%s>:\t%-8s %s\n",insn[i].address, sym,insn[i].mnemonic, insn[i].op_str);
+	else
+		fprintf(stderr, "0x%lx:\t\t%-8s %s\n",insn[i].address,insn[i].mnemonic, insn[i].op_str);
+        bool is_ret = false;
+        for (int g = 0; g < insn[i].detail->groups_count; g++) {
+            if (insn[i].detail->groups[g] == CS_GRP_RET) {
+                is_ret = true;
+                break;
+            }
+        }
+        if (is_ret) break;
+    }
+
+    cs_free(insn, count);
+}
 
 void process_inspect(int pid) {
     struct user_regs_struct regs;
@@ -228,8 +291,114 @@ void delete_command(const char *arg){
 	bp_count--;
 }
 
+pid_t child_pid = -1;
+
+void inject_bp(pid_t pid){
+	for(int i=0; i<bp_count; i++){
+		if(!bp_table[i].enabled) 
+			continue;
+		long orig = ptrace(PTRACE_PEEKDATA, pid, (void *)bp_table[i].addr, 0);
+		if(orig == -1)
+			die("(peekdata) %s", strerror(errno));
+		bp_table[i].original_byte = orig;
+		
+		long mask = (orig & 0xFFFFFFFFFFFFFF00) | 0xCC;
+		if(ptrace(PTRACE_POKEDATA, pid, (void *)bp_table[i].addr, (void *)mask) == -1)
+				die("(pokedata) %s", strerror(errno));
+		fprintf(stderr, "[mdb] breakpoint %d injected at 0x%lx.\n", i+1, bp_table[i].addr);
+	}
+}
+
+int find_bp(uint64_t addr){
+	for(int i =0; bp_count; i++){
+		if(bp_table[i].enabled && bp_table[i].addr == addr)
+			return i;
+	}
+	return -1;
+}
+
+int wait_for_signal(void) {
+    int status;
+    if (ptrace(PTRACE_CONT, child_pid, 0, 0) == -1)
+        die("(cont) %s", strerror(errno));
+
+    waitpid(child_pid, &status, 0);
+
+    // check if child exited normally
+    if (WIFEXITED(status)) {
+        fprintf(stderr, "[mdb] process exited with code %d.\n", WEXITSTATUS(status));
+        child_pid = -1;
+        return 0;
+    }
+
+    //check if child was stopped by our SIGTRAP
+    if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
+        struct user_regs_struct regs;
+        if (ptrace(PTRACE_GETREGS, child_pid, 0, &regs) == -1)
+            die("(getregs) %s", strerror(errno));
+
+        uint64_t hit_addr = regs.rip - 1;
+        int idx = find_bp(hit_addr);
+
+        if (idx == -1) {
+            fprintf(stderr, "[mdb] stopped at unknown address 0x%lx.\n", hit_addr);
+            return 1;
+        }
+
+        fprintf(stderr, "[mdb] hit breakpoint %d: %s at 0x%lx.\n",
+            idx + 1, bp_table[idx].symbol, hit_addr);
+
+        // restore orig byte
+        if (ptrace(PTRACE_POKEDATA, child_pid, (void *)hit_addr,
+                (void *)bp_table[idx].original_byte) == -1)
+            die("(pokedata restore) %s", strerror(errno));
+
+        // revert rip to the breakpoint address
+        regs.rip = hit_addr;
+        if (ptrace(PTRACE_SETREGS, child_pid, 0, &regs) == -1)
+            die("(setregs) %s", strerror(errno));
+        disas_at(child_pid, hit_addr);
+	//stopped at breakpoint
+	return 1;
+    }
+
+    return 1;
+}
+
+void continue_command(void){
+	if(child_pid == -1){
+		fprintf(stderr, "No process running. Use 'r' first.\n");
+		return;
+	}
+	wait_for_signal();
+}
+
+void run_command(const char *filename){
+	if(child_pid != -1){
+		fprintf(stderr, "Program already runnning.\n");
+		return;
+	}
+	child_pid = fork();
+	switch(child_pid){
+		case -1:
+			die("%s", strerror(errno));
+		case 0:
+			//child
+			ptrace(PTRACE_TRACEME, 0, 0, 0);
+			execvp(filename, (char *[]){(char*)filename, NULL});
+			die("%s", strerror(errno));
+	}
+
+	// Parent
+	ptrace(PTRACE_SETOPTIONS, child_pid, 0, PTRACE_O_EXITKILL);
+	waitpid(child_pid, 0, 0);
+	inject_bp(child_pid);
+	fprintf(stderr, "[mdb] process %d started.\n", child_pid);
+	wait_for_signal();
+}
+
 //Main command loop for all inputs
-void command_loop(void){
+void command_loop(const char *filename){
 	char line[256];
 
 	while(1){
@@ -252,11 +421,11 @@ void command_loop(void){
 		}
 		else if (strcmp(line, "r") == 0) {
            		// run
-           		fprintf(stderr, "[stub] r command - not yet implemented\n");
+           		run_command(filename);
 		} 
 		else if (strcmp(line, "c") == 0) {
             		// continue
-            		fprintf(stderr, "[stub] c command - not yet implemented\n");
+            		continue_command();
         	}
 	     	else if (strcmp(line, "q") == 0) {
             		fprintf(stderr, "Bye\n");
@@ -277,7 +446,14 @@ int main(int argc, char **argv)
 
     load_symbols(argv[1]);
 
-    command_loop();
+    if(cs_open(CS_ARCH_X86, CS_MODE_64, &cs_handle) != CS_ERR_OK)
+	    die("Failed to initialise Capstone");
+
+    cs_option(cs_handle, CS_OPT_DETAIL, CS_OPT_ON);
+
+    cs_option(cs_handle, CS_OPT_SYNTAX, CS_OPT_SYNTAX_ATT);
+
+    command_loop(argv[1]);
 
     return 0;
 }
