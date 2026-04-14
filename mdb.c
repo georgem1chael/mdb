@@ -349,7 +349,7 @@ int wait_for_signal(void) {
         regs.rip = hit_addr;
         if (ptrace(PTRACE_SETREGS, child_pid, 0, &regs) == -1)
             die("(setregs) %s", strerror(errno));
-        //disas_at(child_pid, hit_addr)
+        disas_at(child_pid, hit_addr);
 	//stopped at breakpoint
 	return 1;
     }
@@ -366,6 +366,11 @@ void continue_command(void){
 }
 
 void run_command(const char *filename){
+	char full_path[512];
+   	if (filename[0] != '/' && !(filename[0] == '.' && filename[1] == '/')) {
+        	snprintf(full_path, sizeof(full_path), "./%s", filename);
+        	filename = full_path;
+    	}
 	if(child_pid != -1){
 		fprintf(stderr, "Program already runnning.\n");
 		return;
