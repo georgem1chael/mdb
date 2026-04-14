@@ -23,6 +23,10 @@ mdb is a lightweight debugger for Linux x86_64 non-pie binaries built using ptra
 ## Build
 gcc -Wall mdb.c -lelf -lcapstone -o mdb
 
+or using Makefile shortcut:
+
+make run ./test
+
 ## Example
 ./mdb ./test
 (mdb) b main
