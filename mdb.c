@@ -37,6 +37,7 @@
 typedef struct {
     char name[128];
     uint64_t addr;
+    uint64_t size;
 } Symbol;
 
 Symbol sym_table[MAX_SYMBOLS]; //inmemory symbol table
@@ -95,15 +96,35 @@ void disas_at(pid_t pid, uint64_t addr) {
                 break;
             }
         }
+	
+	
+	// repplace address with symbol names using Capstone
+	char op_str_resolved[512];
+	strncpy(op_str_resolved, insn[i].op_str, sizeof(op_str_resolved));
+
+	// check immediate operands directly from Capstone
+	cs_x86 *x86 = &insn[i].detail->x86;
+	for (int op = 0; op < x86->op_count; op++) {
+    		if (x86->operands[op].type == X86_OP_IMM) {
+        		uint64_t imm = (uint64_t)x86->operands[op].imm;
+        		for (int s = 0; s < sym_count; s++) {
+            			if (sym_table[s].addr == imm) {
+                			snprintf(op_str_resolved, sizeof(op_str_resolved),"%s <%s>",insn[i].op_str, sym_table[s].name);
+                			break;
+           			}
+        		}
+    		}
+	}	
+
         if (i == 0)
-            fprintf(stderr, "=> ");
+            fprintf(stderr, "> ");
         else
             fprintf(stderr, "   ");
 
         if (sym)
-        	fprintf(stderr, "0x%lx <%s>:\t%-8s %s\n",insn[i].address, sym,insn[i].mnemonic, insn[i].op_str);
+        	fprintf(stderr, "0x%lx <%s>:\t%-8s %s\n",insn[i].address, sym,insn[i].mnemonic, op_str_resolved);
 	else
-		fprintf(stderr, "0x%lx:\t\t%-8s %s\n",insn[i].address,insn[i].mnemonic, insn[i].op_str);
+		fprintf(stderr, "0x%lx:\t\t%-8s %s\n",insn[i].address,insn[i].mnemonic, op_str_resolved);
         bool is_ret = false;
         for (int g = 0; g < insn[i].detail->groups_count; g++) {
             if (insn[i].detail->groups[g] == CS_GRP_RET) {
@@ -115,36 +136,6 @@ void disas_at(pid_t pid, uint64_t addr) {
     }
 
     cs_free(insn, count);
-}
-
-void process_inspect(int pid) {
-    struct user_regs_struct regs;
-
-    if (ptrace(PTRACE_GETREGS, pid, 0, &regs) == -1) 
-            die("%s", strerror(errno));
-  
-    long current_ins = ptrace(PTRACE_PEEKDATA, pid, regs.rip, 0);
-    if (current_ins == -1) 
-        die("(peekdata) %s", strerror(errno));
-   
-    fprintf(stderr, "=> 0x%llx: 0x%lx\n", regs.rip, current_ins);
- 
-}
-
-long set_breakpoint(int pid, long addr) {
-    return 0; 
-}
-
-void process_step(int pid) {
-
-    if (ptrace(PTRACE_SINGLESTEP, pid, 0, 0) == -1)
-        die("(singlestep) %s", strerror(errno));
- 
-    waitpid(pid, 0, 0);
-}
-
-void serve_breakpoint(int pid, long original_instruction) {
-    return;
 }
 
 // Load symtab from ELF binary
@@ -190,6 +181,7 @@ void load_symbols(const char *filename){
 
                 strncpy(sym_table[sym_count].name, name, 127);
                 sym_table[sym_count].addr = sym.st_value;
+		sym_table[sym_count].size = sym.st_size;
                 sym_count++;
             }
         }
@@ -310,7 +302,7 @@ void inject_bp(pid_t pid){
 }
 
 int find_bp(uint64_t addr){
-	for(int i =0; bp_count; i++){
+	for(int i =0; i < bp_count; i++){
 		if(bp_table[i].enabled && bp_table[i].addr == addr)
 			return i;
 	}
@@ -357,7 +349,7 @@ int wait_for_signal(void) {
         regs.rip = hit_addr;
         if (ptrace(PTRACE_SETREGS, child_pid, 0, &regs) == -1)
             die("(setregs) %s", strerror(errno));
-        disas_at(child_pid, hit_addr);
+        //disas_at(child_pid, hit_addr)
 	//stopped at breakpoint
 	return 1;
     }
@@ -397,6 +389,59 @@ void run_command(const char *filename){
 	wait_for_signal();
 }
 
+const char *find_function(uint64_t addr){
+	for(int i =0; i < sym_count; i++){
+		// exact match
+		if(sym_table[i].addr == addr)
+			return sym_table[i].name;
+	}
+	const char *nearest = "??";
+	uint64_t nearest_addr = 0;
+	for(int i = 0; i < sym_count; i++){
+		// range check for functions with known size
+		if(sym_table[i].addr <= addr && sym_table[i].addr > nearest_addr){
+			nearest_addr = sym_table[i].addr;
+			nearest = sym_table[i].name;
+		}
+	}
+	return nearest;
+}
+
+void step_command(void){
+	if(child_pid == -1){
+		fprintf(stderr, "No process running. Use 'r' first.\n");
+		return;
+	}
+
+	struct user_regs_struct regs;
+	if(ptrace(PTRACE_GETREGS, child_pid, 0, &regs) == -1)
+		die("(getregs) %s", strerror(errno));
+	
+	if(ptrace(PTRACE_SINGLESTEP, child_pid, 0, 0) == -1)
+		die("(singlestep) %s", strerror(errno));
+
+	int status;
+	waitpid(child_pid, &status, 0);
+
+	if(ptrace(PTRACE_GETREGS, child_pid, 0, &regs) == -1)
+		die("(getregs) %s", strerror(errno));
+
+	fprintf(stderr, "0x%llx in %s ()\n", regs.rip, find_function(regs.rip));
+}
+
+void disas_command(void){
+	if(child_pid == -1){
+		fprintf(stderr, "No process runnig. Use 'r' first.\n");
+		return;
+	}
+
+	struct user_regs_struct regs;
+	if(ptrace(PTRACE_GETREGS, child_pid, 0, &regs) == -1)
+		die("(getregs) %s", strerror(errno));
+
+	disas_at(child_pid, regs.rip);
+}
+
 //Main command loop for all inputs
 void command_loop(const char *filename){
 	char line[256];
@@ -427,14 +472,19 @@ void command_loop(const char *filename){
             		// continue
             		continue_command();
         	}
+		else if (strcmp(line, "si") == 0){
+			step_command();
+		}
+		else if (strcmp(line, "disas") == 0){
+			disas_command();
+		}
 	     	else if (strcmp(line, "q") == 0) {
             		fprintf(stderr, "Bye\n");
             		exit(0);
-
         	}
 		else if (line[0] != '\0') {
             		fprintf(stderr, "Unknown command: %s\n", line);
-            		fprintf(stderr, "Commands: b <sym|*addr>, l, d <n>, r, c, q\n");
+            		fprintf(stderr, "Commands: b <sym|*addr>, l, d <n>, r, c, si, disas, q\n");
         	}
 	}
 }
