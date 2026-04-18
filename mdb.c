@@ -57,6 +57,7 @@ int sym_count = 0; //how many symbols loaded
 
 csh cs_handle;
 
+/* Read size bytes from child process memory into buf using PTRACE_PEEKDATA */
 void read_child_memory(pid_t pid, uint64_t addr, uint8_t *buf, size_t size) {
     // PTRACE_PEEKDATA reads 8 bytes at a time
     size_t i = 0;
@@ -71,6 +72,7 @@ void read_child_memory(pid_t pid, uint64_t addr, uint8_t *buf, size_t size) {
     }
 }
 
+/* Disassemble up to 11 instructions from addr in the child process, resolving symbol names */
 void disas_at(pid_t pid, uint64_t addr) {
     // read 128 bytes from child mem,  enough for 11 instructions
     uint8_t buf[128];
@@ -138,7 +140,7 @@ void disas_at(pid_t pid, uint64_t addr) {
     cs_free(insn, count);
 }
 
-// Load symtab from ELF binary
+/* Load the symbol table from the ELF binary's .symtab section */
 void load_symbols(const char *filename){
     //Initialise libelf and opening file
     if(elf_version(EV_CURRENT) == EV_NONE)
@@ -193,6 +195,7 @@ void load_symbols(const char *filename){
     fprintf(stderr, "[mdb] loaded %d symbols from %s\n ", sym_count, filename);
 }
 
+/* Return the address of a symbol by name, or 0 if not found */
 uint64_t find_symbol(const char *name){
     for(int i=0; i < sym_count; i++){
         if(strcmp(sym_table[i].name, name) == 0)
@@ -201,6 +204,7 @@ uint64_t find_symbol(const char *name){
     return 0;
 }
 
+/* Set a breakpoint by symbol name or hex address */
 void breakpoint_command(const char *arg){
 	uint64_t addr = 0;
 	char symbol[128] = {0};
@@ -258,6 +262,7 @@ void breakpoint_command(const char *arg){
 		fprintf(stderr, "Breakpoint %d set at %s (0x%lx). \n", bp_count, symbol, addr);	
 }
 
+/* List all currently set breakpoints with their status */
 void list_command(void){
 	if(bp_count == 0){
 		fprintf(stderr, "No breakpoints set. \n");
@@ -271,6 +276,7 @@ void list_command(void){
 	}
 }
 
+/* Delete breakpoint by 1-based number */
 void delete_command(const char *arg){
 	int n = atoi(arg);
 	if(n < 1 || n > bp_count){
@@ -285,6 +291,8 @@ void delete_command(const char *arg){
 
 pid_t child_pid = -1;
 
+
+/* Inject INT3 0xCC at each enabled breakpoint address in the child process */
 void inject_bp(pid_t pid){
 	for(int i=0; i<bp_count; i++){
 		if(!bp_table[i].enabled) 
@@ -301,6 +309,8 @@ void inject_bp(pid_t pid){
 	}
 }
 
+
+/* Return the index of the breakpoint at addr, or -1 if not found */
 int find_bp(uint64_t addr){
 	for(int i =0; i < bp_count; i++){
 		if(bp_table[i].enabled && bp_table[i].addr == addr)
@@ -309,6 +319,7 @@ int find_bp(uint64_t addr){
 	return -1;
 }
 
+/* Continue child execution and wait for a breakpoint hit, exit, or fatal signal */
 int wait_for_signal(void) {
     int status;
     if (ptrace(PTRACE_CONT, child_pid, 0, 0) == -1)
@@ -321,6 +332,14 @@ int wait_for_signal(void) {
         fprintf(stderr, "[mdb] process exited with code %d.\n", WEXITSTATUS(status));
         child_pid = -1;
         return 0;
+    }
+
+    //Handle SIGSEGV
+    if (WIFSIGNALED(status)) {
+    	fprintf(stderr, "[mdb] process terminated by signal %d (%s).\n",
+        WTERMSIG(status), strsignal(WTERMSIG(status)));
+    	child_pid = -1;
+    	return 0;
     }
 
     //check if child was stopped by our SIGTRAP
@@ -357,6 +376,7 @@ int wait_for_signal(void) {
     return 1;
 }
 
+/* Continue the child process until next breakpoint or exit */
 void continue_command(void){
 	if(child_pid == -1){
 		fprintf(stderr, "No process running. Use 'r' first.\n");
@@ -365,6 +385,7 @@ void continue_command(void){
 	wait_for_signal();
 }
 
+/* Fork and exec the target binary, inject breakpoints, then run until first stop */
 void run_command(const char *filename){
 	char full_path[512];
    	if (filename[0] != '/' && !(filename[0] == '.' && filename[1] == '/')) {
@@ -394,6 +415,7 @@ void run_command(const char *filename){
 	wait_for_signal();
 }
 
+/* Return the name of the nearest symbol at or before addr */
 const char *find_function(uint64_t addr){
 	for(int i =0; i < sym_count; i++){
 		// exact match
@@ -412,6 +434,7 @@ const char *find_function(uint64_t addr){
 	return nearest;
 }
 
+/* Execute a single instruction in the child process and print the new RIP */
 void step_command(void){
 	if(child_pid == -1){
 		fprintf(stderr, "No process running. Use 'r' first.\n");
@@ -434,6 +457,8 @@ void step_command(void){
 	fprintf(stderr, "0x%llx in %s ()\n", regs.rip, find_function(regs.rip));
 }
 
+
+/* Print disassembly from the current RIP of the child process */
 void disas_command(void){
 	if(child_pid == -1){
 		fprintf(stderr, "No process runnig. Use 'r' first.\n");
@@ -447,7 +472,7 @@ void disas_command(void){
 	disas_at(child_pid, regs.rip);
 }
 
-//Main command loop for all inputs
+/* Main REPL: read and dispatch commands until EOF or 'q' */
 void command_loop(const char *filename){
 	char line[256];
 
