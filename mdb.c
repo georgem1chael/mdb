@@ -319,6 +319,109 @@ int find_bp(uint64_t addr){
 	return -1;
 }
 
+/* Parse /proc/pid/maps and resolve any pending breakpoints against shared libs */
+void resolve_pending_breakpoints(pid_t pid) {
+    // Check if there are any pending breakpoints at all
+    int has_pending = 0;
+    for (int i = 0; i < bp_count; i++) {
+        if (!bp_table[i].enabled) { has_pending = 1; break; }
+    }
+    if (!has_pending) return;
+
+    char maps_path[64];
+    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+    FILE *maps = fopen(maps_path, "r");
+    if (!maps) {
+        fprintf(stderr, "[mdb] cannot open %s: %s\n", maps_path, strerror(errno));
+        return;
+    }
+
+    char line[512];
+    while (fgets(line, sizeof(line), maps)) {
+        // Only care about executable mappings backed by a file
+        // Format: start-end perms offset dev inode pathname
+        uint64_t map_start, map_end, map_offset;
+        char perms[8], pathname[256];
+        pathname[0] = '\0';
+
+        int parsed = sscanf(line, "%lx-%lx %4s %lx %*s %*s %255s",
+                            &map_start, &map_end, perms, &map_offset, pathname);
+        if (parsed < 4) continue;
+        if (perms[2] != 'x') continue;       // only executable segments
+        if (pathname[0] == '\0') continue;    // anonymous mapping
+        if (pathname[0] == '[') continue;     // [stack], [heap], [vdso], etc.
+
+        // Open and parse this shared lib's ELF for its .dynsym / .symtab
+        if (elf_version(EV_CURRENT) == EV_NONE) continue;
+        int fd = open(pathname, O_RDONLY);
+        if (fd < 0) continue;
+
+        Elf *elf = elf_begin(fd, ELF_C_READ, NULL);
+        if (!elf) { close(fd); continue; }
+
+        Elf_Scn *scn = NULL;
+        GElf_Shdr shdr;
+
+        while ((scn = elf_nextscn(elf, scn)) != NULL) {
+            if (gelf_getshdr(scn, &shdr) != &shdr) continue;
+            // Check both .symtab and .dynsym — libc stripped builds only have .dynsym
+            if (shdr.sh_type != SHT_SYMTAB && shdr.sh_type != SHT_DYNSYM) continue;
+            if (shdr.sh_entsize == 0) continue;
+
+            Elf_Data *data = elf_getdata(scn, NULL);
+            if (!data) continue;
+            int count = shdr.sh_size / shdr.sh_entsize;
+
+            for (int i = 0; i < count; i++) {
+                GElf_Sym sym;
+                if (gelf_getsym(data, i, &sym) != &sym) continue;
+                if (sym.st_value == 0) continue;
+
+                const char *name = elf_strptr(elf, shdr.sh_link, sym.st_name);
+                if (!name || name[0] == '\0') continue;
+
+                // Try to match against every pending breakpoint
+                for (int b = 0; b < bp_count; b++) {
+                    if (bp_table[b].enabled) continue;  // already resolved
+                    if (strcmp(bp_table[b].symbol, name) != 0) continue;
+
+                    // runtime addr = map base + symbol offset within the lib
+                    // map_offset tells us where in the file this segment starts,
+                    // so we subtract it to get the true load bias
+                    uint64_t load_bias = map_start - map_offset;
+                    uint64_t runtime_addr = load_bias + sym.st_value;
+
+                    bp_table[b].addr = runtime_addr;
+                    bp_table[b].enabled = 1;
+
+                    // Inject the INT3 right now
+                    long orig = ptrace(PTRACE_PEEKDATA, pid, (void *)runtime_addr, 0);
+                    if (orig == -1 && errno != 0) {
+                        fprintf(stderr, "[mdb] peekdata failed for '%s': %s\n",
+                                name, strerror(errno));
+                        bp_table[b].enabled = 0;
+                        continue;
+                    }
+                    bp_table[b].original_byte = orig;
+                    long patched = (orig & 0xFFFFFFFFFFFFFF00L) | 0xCC;
+                    if (ptrace(PTRACE_POKEDATA, pid, (void *)runtime_addr,
+                               (void *)patched) == -1) {
+                        fprintf(stderr, "[mdb] pokedata failed for '%s': %s\n",
+                                name, strerror(errno));
+                        bp_table[b].enabled = 0;
+                        continue;
+                    }
+                    fprintf(stderr, "[mdb] resolved pending breakpoint %d: '%s' → 0x%lx\n",
+                            b + 1, name, runtime_addr);
+                }
+            }
+        }
+        elf_end(elf);
+        close(fd);
+    }
+    fclose(maps);
+}
+
 /* Continue child execution and wait for a breakpoint hit, exit, or fatal signal */
 int wait_for_signal(void) {
     int status;
@@ -382,6 +485,7 @@ void continue_command(void){
 		fprintf(stderr, "No process running. Use 'r' first.\n");
 		return;
 	}
+	resolve_pending_breakpoints(child_pid);
 	wait_for_signal();
 }
 
@@ -411,6 +515,7 @@ void run_command(const char *filename){
 	ptrace(PTRACE_SETOPTIONS, child_pid, 0, PTRACE_O_EXITKILL);
 	waitpid(child_pid, 0, 0);
 	inject_bp(child_pid);
+	resolve_pending_breakpoints(child_pid);
 	fprintf(stderr, "[mdb] process %d started.\n", child_pid);
 	wait_for_signal();
 }
@@ -441,6 +546,7 @@ void step_command(void){
 		return;
 	}
 
+	resolve_pending_breakpoints(child_pid);
 	struct user_regs_struct regs;
 	if(ptrace(PTRACE_GETREGS, child_pid, 0, &regs) == -1)
 		die("(getregs) %s", strerror(errno));
