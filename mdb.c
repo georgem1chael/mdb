@@ -223,6 +223,13 @@ void breakpoint_command(const char *arg){
 		addr = find_symbol(arg);
 		snprintf(symbol, sizeof(symbol), "%s", arg);
 		if(addr == 0){
+			//duplicate pending symbols
+			for(int i =0; i < bp_count; i++){
+				if(strcmp(bp_table[i].symbol, symbol) == 0){
+						fprintf(stderr, "Breakpoint already set for '%s'.\n", arg);
+						return;
+						}
+			}
 			// Symbol not foound, ask to set it as pending
 			fprintf(stderr, "Symbol '%s' not found, Enable as pending breakpoint? (y/n) ", arg);
 			fflush(stderr);
@@ -245,6 +252,13 @@ void breakpoint_command(const char *arg){
 		}
 	}
 
+	//duplicate resolved symbols and addresses
+	for(int i =0; i< bp_count; i++){
+		if(bp_table[i].addr == addr){
+			fprintf(stderr, "Breakpoint already set at 0x%lx (%s).\n", addr, bp_table[i].symbol);
+			return;
+		}
+	}
 	if(bp_count >= MAX_BREAKPOINTS){
 		fprintf(stderr, "Breakpoint table full.\n");
 		return;
